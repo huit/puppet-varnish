@@ -1,0 +1,240 @@
+#
+# Varnish config based on the following
+#
+#   https://gist.github.com/benclark/1942570/raw/22a7dfa1486a80b281230d6d826986f2575a81ae/default.vcl
+#
+# for HWPI group, 
+#
+
+# call this "default" or "drupal"?
+backend default {
+  .host = "<%= backend_host %>";
+  .port = "<%= backend_port %>";
+  .connect_timeout = 600s;
+  .first_byte_timeout = 600s;
+  .between_bytes_timeout = 600s;
+  
+  # Not sure if this is still needed/useful  
+  .probe = {
+    .url = "/";
+    .interval = <%= probe_interval %>;
+    .timeout  = <%= probe_timeout %>;
+    .window   = <%= probe_window %>;
+    .threshold = 3;
+  }
+}
+
+acl purge {
+  "localhost";
+<% purge_ips.each do |ip| -%>
+   "<%= ip %>";
+<% end -%>
+}
+
+sub vcl_recv {
+  if (req.request == "GET" && req.url ~ "^/varnishcheck$") {
+    error 200 "Varnish is Ready";
+  }
+
+  # Add a unique header containing the client address.
+  set req.http.X-Forwarded-For = client.ip;
+
+  if (req.request != "GET" &&
+    req.request != "HEAD" &&
+    req.request != "PUT" &&
+    req.request != "POST" &&
+    req.request != "TRACE" &&
+    req.request != "OPTIONS" &&
+    req.request != "PURGE" &&
+    req.request != "DELETE") {
+      # Non-RFC2616 or CONNECT which is weird.
+      return (pipe);
+  }
+
+  # We only deal with GET, PURGE and HEAD by default.
+  if (req.request != "GET" && req.request != "HEAD" && req.request != "PURGE") {
+    return (pass);
+  }
+
+  # --- PURGE ---
+  if (req.request == "PURGE") {
+    # Check if the ip coresponds with the acl purge
+    if (!client.ip ~ purge) {
+      # Return error code 405 (Forbidden) when not
+      error 405 "Not allowed.";
+    }
+    return (lookup);
+  }
+
+  # --- PASSTHROUGH ---
+
+  # Always cache things with these extensions.
+  if (req.url ~ "\.(js|css|jpg|jpeg|png|gif|gz|tgz|bz2|tbz|mp3|ogg|swf)$") {
+    unset req.http.cookie;
+    return (lookup);
+  }
+
+  # Do not cache if HTTP authorized.
+  if (req.http.Authorization) {
+    return (pass);
+  }
+
+  # Skip the Varnish cache for install, update, and cron.
+  if (req.url ~ "install\.php|update\.php|cron\.php") {
+    return (pass);
+  }
+
+  # Skip the Varnish cache for Springboard standalone cron.
+  if (req.url ~ "queue_processor_cron|fundraiser_cron") {
+    return (pass);
+  }
+
+  # Pass server-status.
+  if (req.url ~ ".*/server-status$") {
+    return (pass);
+  }
+
+  # Support for Pressflow Cookie-Cache Bypass.
+  if (req.http.cookie ~ "NO_CACHE") {
+    return (pass);
+  }
+
+  # Force lookup if the request is a no-cache request from the client.
+  if (req.http.Cache-Control ~ "no-cache") {
+    return (pass);
+  }
+
+  # Don't check cache if Drupal SESSION is set.
+  if (req.http.cookie ~ "SESS") {
+    return (pass);
+  }
+
+  # We  "hide" the non-session cookies.
+  if (req.http.cookie) {
+    set req.http.X-Varnish-Cookie = req.http.cookie;
+    unset req.http.cookie;
+  }
+
+  # --- MISC ---
+
+  # Normalize the Accept-Encoding header
+  # as per: http://varnish-cache.org/wiki/FAQ/Compression
+  if (req.http.Accept-Encoding) {
+    if (req.url ~ "\.(jpg|png|gif|gz|tgz|bz2|tbz|mp3|ogg)$") {
+      # No point in compressing these.
+      unset req.http.Accept-Encoding;
+    }
+    else if (req.http.Accept-Encoding ~ "gzip") {
+      set req.http.Accept-Encoding = "gzip";
+    }
+    else if (req.http.Accept-Encoding ~ "deflate") {
+      # Next, try deflate if it is supported.
+      set req.http.Accept-Encoding = "deflate";
+    }
+    else {
+      # Unknown or deflate algorithm.
+      unset req.http.Accept-Encoding;
+    }
+  }
+
+  # Let's have a little grace.
+  set req.grace = 5m;
+
+  return (lookup);
+}
+
+sub vcl_hash {
+  if (req.http.cookie) {
+    hash_data(req.http.cookie);
+  }
+}
+
+# Strip any cookies before an image/js/css is inserted into cache.
+sub vcl_fetch {
+  set beresp.grace = 5m;
+
+  # These status codes should always pass through and never cache.
+  if (beresp.status == 503 || beresp.status == 500) {
+    set beresp.http.X-Cacheable = "NO: obj.status";
+    set beresp.http.X-Cacheable-status = beresp.status;
+    return (hit_for_pass);
+  }
+
+  if (req.url ~ "\.(js|css|jpg|jpeg|png|gif|gz|tgz|bz2|tbz|mp3|ogg|swf)(\?[a-z0-9]+)?$") {
+    unset beresp.http.set-cookie;
+  }
+  else if (beresp.http.Cache-Control) {
+    unset beresp.http.Expires;
+  }
+
+  if (beresp.status == 301) {
+    set beresp.ttl = 1h;
+    return(deliver);
+  }
+
+  # All tests passed, therefore item is cacheable
+  set beresp.http.X-Cacheable = "YES";
+}
+
+# Set a header to track a cache HIT/MISS.
+sub vcl_deliver {
+  if (obj.hits > 0) {
+    set resp.http.X-Varnish-Cache = "HIT";
+    set resp.http.X-Varnish-Hits = obj.hits;
+  }
+  else {
+    set resp.http.X-Varnish-Cache = "MISS";
+  }
+  # Set a header to track the webhead.
+  set resp.http.X-Varnish-IP = server.ip;
+}
+
+sub vcl_hit {
+  if (req.request == "PURGE") {
+    purge;
+    error 200 "Purged.";
+  }
+}
+
+sub vcl_miss {
+  if (req.http.X-Varnish-Cookie) {
+    set bereq.http.cookie = req.http.X-Varnish-Cookie;
+    unset bereq.http.X-Varnish-Cookie;
+  }
+  if (req.request == "PURGE") {
+    purge;
+    error 200 "Purged.";
+  }
+}
+
+sub vcl_error {
+  # Let's deliver a friendlier error page.
+  set obj.http.Content-Type = "text/html; charset=utf-8";
+  synthetic {"
+  <?xml version="1.0" encoding="utf-8"?>
+  <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"
+   "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+  <html>
+    <head>
+      <title>"} + obj.status + " " + obj.response + {"</title>
+    </head>
+    <body>
+    <div id="page">
+      <h1>Page Could Not Be Loaded</h1>
+      <p>We're very sorry, but the page could not be loaded properly. This should be fixed very soon, and we apologize for any inconvenience.</p>
+      <p/>
+      <p><em>Note:</em> If this is a new installation, you may need to wait a short time until the proxy detects the application.</p>
+      <hr />
+      <h4>Debug Info:</h4>
+        <pre>Status: "} + obj.status + {"
+Response: "} + obj.response + {"
+XID: "} + req.xid + {"</pre>
+      </div>
+    </body>
+   </html>
+  "};
+  return (deliver);
+}
+
+
+
